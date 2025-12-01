@@ -1,0 +1,3 @@
+# Ignore model checkpoints and logs
+cifar10/
+logs/
