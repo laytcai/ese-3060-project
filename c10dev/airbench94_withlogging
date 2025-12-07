@@ -464,7 +464,7 @@ def main(run):
     epoch = 'eval'
     print_training_details(locals(), is_final_entry=True)
 
-    return tta_val_acc
+    return tta_val_acc, total_time_seconds
 
 if __name__ == "__main__":
     with open(sys.argv[0]) as f:
@@ -472,10 +472,13 @@ if __name__ == "__main__":
 
     print_columns(logging_columns_list, is_head=True)
     #main('warmup')
-    accs = torch.tensor([main(run) for run in range(500)])
+    results = [main(run) for run in range(500)]
+    accs = torch.tensor([r[0] for r in results])
+    times = torch.tensor([r[1] for r in results])
     print('Mean: %.4f    Std: %.4f' % (accs.mean(), accs.std()))
+    print('Mean training time (s): %.4f' % (times.mean()))
 
-    log = {'code': code, 'accs': accs}
+    log = {'code': code, 'accs': accs, 'times': times}
     log_dir = os.path.join('logs', str(uuid.uuid4()))
     os.makedirs(log_dir, exist_ok=True)
     log_path = os.path.join(log_dir, 'log.pt')
