@@ -91,67 +91,104 @@ def tta_views(x):
 @torch.no_grad()
 def evaluate_dynamic(model, loader, tau=0.80, margin_thresh=0.20, device='cuda'):
     """
-    Dynamic-TTA evaluation (batch-aware).
-    - First run 1-view prediction on the whole batch.
-    - For each image, compute confidence.
-    - If confidence < thresholds, re-evaluate that image subset with 6-view TTA.
+    Dynamic-TTA evaluation (vectorized, fast version).
+
+    Stage 1: one forward over all test images to get confidence.
+    Stage 2: run 6-view TTA only on "hard" images (low confidence / low margin),
+             using the same TTA pattern as the original infer_mirror_translate.
     """
     model.eval()
-    correct = 0
-    total = 0
+    device = torch.device(device)
 
-    # stats (for logging / report)
-    num_easy = 0
-    num_hard = 0
-    total_forwards = 0  # counts per-image forwards
+    # ---- Load all test images and labels on the right device ----
+    # This mirrors the original infer() implementation.
+    test_images = loader.normalize(loader.images).to(device)   # [N, 3, 32, 32]
+    labels      = loader.labels.to(device)                     # [N]
+    N = labels.size(0)
 
-    for x, y in loader:
-        x = x.to(device)
-        y = y.to(device)
-        batch_size = x.size(0)
+    num_classes = 10  # CIFAR-10
+    # Store 1-view logits for all images
+    logits1_all = torch.empty((N, num_classes),
+                              dtype=torch.float16,
+                              device=device)
 
-        # ---- Stage 1: cheap 1-view pass for the whole batch ----
-        logits1 = model(x)                      # [B, 10]
-        total_forwards += batch_size            # each image seen once
-        max_prob, margin = prediction_confidence(logits1)  # [B]
+    use_tta = torch.empty(N, dtype=torch.bool, device=device)
 
-        # decide per-example whether to use TTA
-        use_tta = (max_prob < tau) | (margin < margin_thresh)  # [B] bool
-        easy_mask = ~use_tta
-        hard_mask = use_tta
+    total_forward_images = 0  # track how many image-forwards we do
 
-        num_easy += easy_mask.sum().item()
-        num_hard += hard_mask.sum().item()
+    # -------- Stage 1: 1-view screening over all images --------
+    chunk_size = 2000
+    for start in range(0, N, chunk_size):
+        end = min(start + chunk_size, N)
+        x = test_images[start:end]            # [B, 3, 32, 32]
 
-        # start with 1-view logits as the default
-        logits_final = logits1.clone()
+        logits1 = model(x)                    # 1-view logits
+        logits1_all[start:end] = logits1
+        total_forward_images += x.size(0)
 
-        # ---- Stage 2: full TTA only for "hard" examples ----
-        if hard_mask.any():
-            idx_hard = hard_mask.nonzero(as_tuple=False).squeeze(1)  # [Bh]
-            x_hard = x[idx_hard]                                     # [Bh, 3, 32, 32]
+        # Compute confidence & margin in float32 for numerical stability
+        max_prob, margin = prediction_confidence(logits1.float())
+        use_tta[start:end] = (max_prob < tau) | (margin < margin_thresh)
 
-            # accumulate TTA logits for hard subset only
-            logits_accum = torch.zeros(
-                (x_hard.size(0), logits1.size(1)),
-                device=device,
-                dtype=logits1.dtype,
-            )
+    easy_mask = ~use_tta
+    hard_mask = use_tta
+    num_easy = int(easy_mask.sum().item())
+    num_hard = int(hard_mask.sum().item())
 
-            for view in tta_views(x_hard):
-                logits_view = model(view)          # [Bh, 10]
-                logits_accum += logits_view
-                total_forwards += x_hard.size(0)   # each view sees Bh images
+    # -------- Stage 2: TTA only on hard images --------
+    preds = torch.empty(N, dtype=torch.long, device=device)
 
-            logits_tta_hard = logits_accum / 6.0
-            logits_final[idx_hard] = logits_tta_hard
+    # Easy examples: use 1-view prediction
+    if num_easy > 0:
+        preds[easy_mask] = logits1_all[easy_mask].argmax(dim=1)
 
-        # ---- Final predictions for this batch ----
-        pred = logits_final.argmax(dim=1)
-        correct += (pred == y).sum().item()
-        total += batch_size
+    if num_hard > 0:
+        hard_indices = hard_mask.nonzero(as_tuple=False).squeeze(1)  # [H]
+        hard_images  = test_images[hard_indices]                     # [H, 3, 32, 32]
+        H = hard_images.size(0)
 
-    acc = 100.0 * correct / total
+        logits_hard = torch.empty((H, num_classes),
+                                  dtype=torch.float16,
+                                  device=device)
+
+        for start in range(0, H, chunk_size):
+            end = min(start + chunk_size, H)
+            x = hard_images[start:end]      # [b, 3, 32, 32]
+
+            # === Original infer_mirror_translate logic ===
+            # 1) mirror/no-mirror
+            logits_base = 0.5 * model(x) + 0.5 * model(x.flip(-1))
+            total_forward_images += 2 * x.size(0)
+
+            # 2) translations + mirror
+            pad = 1
+            padded = F.pad(x, (pad,)*4, mode='reflect')
+            translated_views = [
+                padded[:, :, 0:32, 0:32],
+                padded[:, :, 2:34, 2:34],
+            ]
+
+            logits_trans = 0
+            for tv in translated_views:
+                logits_tv = 0.5 * model(tv) + 0.5 * model(tv.flip(-1))
+                logits_trans += logits_tv
+                total_forward_images += 2 * tv.size(0)
+
+            logits_trans /= 2.0  # average over the two translations
+
+            # 3) combine base + translated
+            logits_batch = 0.5 * logits_base + 0.5 * logits_trans
+            logits_hard[start:end] = logits_batch
+
+        preds[hard_indices] = logits_hard.argmax(dim=1)
+
+    # -------- Final accuracy & stats --------
+    correct = (preds == labels).sum().item()
+    acc = 100.0 * correct / N
+
+    avg_forwards_per_image = total_forward_images / float(N)
+    print(f"[Dynamic TTA] easy={num_easy} hard={num_hard}, "
+          f"avg_forwards_per_image={avg_forwards_per_image:.2f}")
 
     return acc
 
