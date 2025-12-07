@@ -454,7 +454,10 @@ def main(run):
 
     norm_biases = [p for k, p in model.named_parameters() if 'norm' in k and p.requires_grad]
     head_params = list(model[7].parameters())
-    other_params = [p for k, p in model.named_parameters() if 'norm' not in k and p.requires_grad]
+    other_params = [
+        p for k, p in model.named_parameters()
+        if 'norm' not in k and p.requires_grad and p not in head_params
+    ]
     param_configs = [
         dict(params=norm_biases, lr=lr_biases,              weight_decay=wd / lr_biases),
         dict(params=other_params, lr=lr,                    weight_decay=wd / lr),
