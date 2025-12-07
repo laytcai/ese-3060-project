@@ -460,6 +460,7 @@ def main(run):
     starter = torch.cuda.Event(enable_timing=True)
     ender = torch.cuda.Event(enable_timing=True)
     total_time_seconds = 0.0
+    epoch_times = []
 
     # Initialize the whitening layer using training images
     starter.record()
@@ -512,7 +513,9 @@ def main(run):
 
         ender.record()
         torch.cuda.synchronize()
-        total_time_seconds += 1e-3 * starter.elapsed_time(ender)
+        epoch_time_seconds = 1e-3 * starter.elapsed_time(ender)
+        total_time_seconds += epoch_time_seconds
+        epoch_times.append(epoch_time_seconds)
 
         ####################
         #    Evaluation    #
@@ -537,6 +540,8 @@ def main(run):
 
     epoch = 'eval'
     print_training_details(locals(), is_final_entry=True)
+    epoch_times_t = torch.tensor(epoch_times)
+    print('Train epoch time mean: %.4f s    Std: %.4f s' % (epoch_times_t.mean().item(), epoch_times_t.std().item()))
 
     return tta_val_acc
 
@@ -555,4 +560,3 @@ if __name__ == "__main__":
     log_path = os.path.join(log_dir, 'log.pt')
     print(os.path.abspath(log_path))
     torch.save(log, os.path.join(log_dir, 'log.pt'))
-
