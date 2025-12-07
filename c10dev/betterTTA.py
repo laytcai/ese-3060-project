@@ -91,57 +91,75 @@ def tta_views(x):
 @torch.no_grad()
 def evaluate_dynamic(model, loader, tau=0.80, margin_thresh=0.20, device='cuda'):
     """
-    Dynamic-TTA evaluation.
-    - First run 1-view prediction.
-    - If confidence >= thresholds, accept.
-    - Otherwise run full 6-view TTA.
+    Dynamic-TTA evaluation (batch-aware).
+    - First run 1-view prediction on the whole batch.
+    - For each image, compute confidence.
+    - If confidence < thresholds, re-evaluate that image subset with 6-view TTA.
     """
     model.eval()
     correct = 0
     total = 0
 
-    # stats (useful for your paper!!)
+    # stats (for logging / report)
     num_easy = 0
     num_hard = 0
-    total_forwards = 0
+    total_forwards = 0  # counts per-image forwards
 
     for x, y in loader:
         x = x.to(device)
         y = y.to(device)
+        batch_size = x.size(0)
 
-        # ---- Stage 1: cheap screening pass ----
-        logits1 = model(x)
-        total_forwards += 1
-        max_prob, margin = prediction_confidence(logits1)
+        # ---- Stage 1: cheap 1-view pass for the whole batch ----
+        logits1 = model(x)                      # [B, 10]
+        total_forwards += batch_size            # each image seen once
+        max_prob, margin = prediction_confidence(logits1)  # [B]
 
-        use_tta = (max_prob < tau) | (margin < margin_thresh)
+        # decide per-example whether to use TTA
+        use_tta = (max_prob < tau) | (margin < margin_thresh)  # [B] bool
+        easy_mask = ~use_tta
+        hard_mask = use_tta
 
-        if not use_tta.item():
-            # confident → no TTA needed
-            num_easy += 1
-            pred = logits1.argmax(dim=1)
-        else:
-            # ---- Stage 2: expensive TTA for hard examples ----
-            num_hard += 1
-            logits_accum = torch.zeros_like(logits1)
+        num_easy += easy_mask.sum().item()
+        num_hard += hard_mask.sum().item()
 
-            for view in tta_views(x):
-                logits_view = model(view)
+        # start with 1-view logits as the default
+        logits_final = logits1.clone()
+
+        # ---- Stage 2: full TTA only for "hard" examples ----
+        if hard_mask.any():
+            idx_hard = hard_mask.nonzero(as_tuple=False).squeeze(1)  # [Bh]
+            x_hard = x[idx_hard]                                     # [Bh, 3, 32, 32]
+
+            # accumulate TTA logits for hard subset only
+            logits_accum = torch.zeros(
+                (x_hard.size(0), logits1.size(1)),
+                device=device,
+                dtype=logits1.dtype,
+            )
+
+            for view in tta_views(x_hard):
+                logits_view = model(view)          # [Bh, 10]
                 logits_accum += logits_view
-                total_forwards += 1
+                total_forwards += x_hard.size(0)   # each view sees Bh images
 
-            logits_final = logits_accum / 6.0
-            pred = logits_final.argmax(dim=1)
+            logits_tta_hard = logits_accum / 6.0
+            logits_final[idx_hard] = logits_tta_hard
 
+        # ---- Final predictions for this batch ----
+        pred = logits_final.argmax(dim=1)
         correct += (pred == y).sum().item()
-        total += y.size(0)
+        total += batch_size
 
     acc = 100.0 * correct / total
 
-    print(f"[Dynamic TTA] easy={num_easy} hard={num_hard}, "
-          f"avg_forwards_per_image={total_forwards/total:.2f}")
+    print(
+        f"[Dynamic TTA] easy={num_easy} hard={num_hard}, "
+        f"avg_forwards_per_image={total_forwards/total:.2f}"
+    )
 
     return acc
+
 
 #############################################
 #                DataLoader                 #
