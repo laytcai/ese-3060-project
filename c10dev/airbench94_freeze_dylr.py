@@ -38,7 +38,7 @@ torch.backends.cudnn.benchmark = True
 
 hyp = {
     'opt': {
-        'train_epochs': 10.5,
+        'train_epochs': 9.9,
         'batch_size': 1024,
         'lr': 11.5,                 # learning rate per 1024 examples
         'momentum': 0.85,
@@ -48,8 +48,11 @@ hyp = {
         'whiten_bias_epochs': 3,    # how many epochs to train the whitening layer bias before freezing
 
         # NEW: progressive freezing schedule (None = no freezing)
-        'freeze_block1_epoch': 6,
+        'freeze_block1_epoch': None,
         'freeze_block2_epoch': None,
+
+        # NEW: LR boost for classifier head
+        'head_lr_multiplier': 1.5,
     },
     'aug': {
         'flip': True,
@@ -420,6 +423,9 @@ def main(run):
     wd = hyp['opt']['weight_decay'] * batch_size / kilostep_scale
     lr_biases = lr * hyp['opt']['bias_scaler']
 
+    head_lr_mult = hyp['opt'].get('head_lr_multiplier', 1.0)
+
+
     loss_fn = nn.CrossEntropyLoss(label_smoothing=hyp['opt']['label_smoothing'], reduction='none')
     test_loader = CifarLoader('cifar10', train=False, batch_size=2000)
     train_loader = CifarLoader('cifar10', train=True, batch_size=batch_size, aug=hyp['aug'])
@@ -434,23 +440,52 @@ def main(run):
     freeze_block1_epoch = hyp['opt'].get('freeze_block1_epoch', None)
     freeze_block2_epoch = hyp['opt'].get('freeze_block2_epoch', None)
 
+    # NEW: convert last freeze epoch → approximate step index
+    last_freeze_epoch = None
+    if freeze_block1_epoch is not None:
+        last_freeze_epoch = float(freeze_block1_epoch)
+    if freeze_block2_epoch is not None:
+        last_freeze_epoch = float(freeze_block2_epoch)
+    freeze_step = None
+    if last_freeze_epoch is not None:
+        freeze_step = int(total_train_steps * last_freeze_epoch / epochs)
+
     current_steps = 0
 
     norm_biases = [p for k, p in model.named_parameters() if 'norm' in k and p.requires_grad]
+    head_params = list(model[7].parameters())
     other_params = [p for k, p in model.named_parameters() if 'norm' not in k and p.requires_grad]
-    param_configs = [dict(params=norm_biases, lr=lr_biases, weight_decay=wd/lr_biases),
-                     dict(params=other_params, lr=lr, weight_decay=wd/lr)]
+    param_configs = [
+        dict(params=norm_biases, lr=lr_biases,              weight_decay=wd / lr_biases),
+        dict(params=other_params, lr=lr,                    weight_decay=wd / lr),
+        dict(params=head_params,  lr=lr * head_lr_mult,     weight_decay=wd / (lr * head_lr_mult)),
+    ]
     optimizer = torch.optim.SGD(param_configs, momentum=momentum, nesterov=True)
 
     def get_lr(step):
         warmup_steps = int(total_train_steps * 0.23)
-        warmdown_steps = total_train_steps - warmup_steps
+
+        # If no freeze configured, or freeze is very early, fall back to original schedule
+        if freeze_step is None or freeze_step <= warmup_steps:
+            warmdown_steps = total_train_steps - warmup_steps
+            if step < warmup_steps:
+                frac = step / warmup_steps
+                return 0.2 * (1 - frac) + 1.0 * frac
+            else:
+                frac = (step - warmup_steps) / warmdown_steps
+                return 1.0 * (1 - frac) + 0.07 * frac
+
+        # With freezing: keep LR flat after warmup until freeze_step, then warmdown
         if step < warmup_steps:
             frac = step / warmup_steps
             return 0.2 * (1 - frac) + 1.0 * frac
+        elif step < freeze_step:
+            return 1.0
         else:
-            frac = (step - warmup_steps) / warmdown_steps
+            warmdown_steps2 = max(1, total_train_steps - freeze_step)
+            frac = (step - freeze_step) / warmdown_steps2
             return 1.0 * (1 - frac) + 0.07 * frac
+
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, get_lr)
 
     alpha_schedule = 0.95**5 * (torch.arange(total_train_steps+1) / total_train_steps)**3
