@@ -451,13 +451,15 @@ def main(run):
         freeze_step = int(total_train_steps * last_freeze_epoch / epochs)
 
     current_steps = 0
-
     norm_biases = [p for k, p in model.named_parameters() if 'norm' in k and p.requires_grad]
     head_params = list(model[7].parameters())
+    # NEW: compare by id() instead of tensor equality to avoid shape mismatch error
+    head_param_ids = {id(p) for p in head_params}
     other_params = [
         p for k, p in model.named_parameters()
-        if 'norm' not in k and p.requires_grad and p not in head_params
+        if 'norm' not in k and p.requires_grad and id(p) not in head_param_ids
     ]
+
     param_configs = [
         dict(params=norm_biases, lr=lr_biases,              weight_decay=wd / lr_biases),
         dict(params=other_params, lr=lr,                    weight_decay=wd / lr),
