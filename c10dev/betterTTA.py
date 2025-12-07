@@ -153,11 +153,6 @@ def evaluate_dynamic(model, loader, tau=0.80, margin_thresh=0.20, device='cuda')
 
     acc = 100.0 * correct / total
 
-    print(
-        f"[Dynamic TTA] easy={num_easy} hard={num_hard}, "
-        f"avg_forwards_per_image={total_forwards/total:.2f}"
-    )
-
     return acc
 
 
