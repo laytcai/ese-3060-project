@@ -38,7 +38,7 @@ torch.backends.cudnn.benchmark = True
 
 hyp = {
     'opt': {
-        'train_epochs': 10.5,
+        'train_epochs': 10.7,
         'batch_size': 1024,
         'lr': 11.5,                 # learning rate per 1024 examples
         'momentum': 0.85,
@@ -48,7 +48,7 @@ hyp = {
         'whiten_bias_epochs': 3,    # how many epochs to train the whitening layer bias before freezing
 
         # NEW: progressive freezing schedule (None = no freezing)
-        'freeze_block1_epoch': 8,
+        'freeze_block1_epoch': 9,
         'freeze_block2_epoch': None,
     },
     'aug': {
