@@ -397,7 +397,6 @@ def main(run):
     starter = torch.cuda.Event(enable_timing=True)
     ender = torch.cuda.Event(enable_timing=True)
     total_time_seconds = 0.0
-    epoch_times = []
 
     # Initialize the whitening layer using training images
     starter.record()
@@ -439,9 +438,7 @@ def main(run):
 
         ender.record()
         torch.cuda.synchronize()
-        epoch_time_seconds = 1e-3 * starter.elapsed_time(ender)
-        total_time_seconds += epoch_time_seconds
-        epoch_times.append(epoch_time_seconds)
+        total_time_seconds += 1e-3 * starter.elapsed_time(ender)
 
         ####################
         #    Evaluation    #
@@ -458,6 +455,7 @@ def main(run):
     #  TTA Evaluation  #
     ####################
 
+    train_time_seconds = total_time_seconds
     starter.record()
     tta_val_acc = evaluate(model, test_loader, tta_level=hyp['net']['tta_level'])
     ender.record()
@@ -466,19 +464,20 @@ def main(run):
 
     epoch = 'eval'
     print_training_details(locals(), is_final_entry=True)
-    epoch_times_t = torch.tensor(epoch_times)
-    print('Train epoch time mean: %.4f s    Std: %.4f s' % (epoch_times_t.mean().item(), epoch_times_t.std().item()))
 
-    return tta_val_acc
+    return tta_val_acc, train_time_seconds
 
 if __name__ == "__main__":
     with open(sys.argv[0]) as f:
         code = f.read()
 
     print_columns(logging_columns_list, is_head=True)
-    #main('warmup')
-    accs = torch.tensor([main(run) for run in range(25)])
+    main('warmup')
+    results = [main(run) for run in range(2)]
+    accs = torch.tensor([r[0] for r in results])
+    train_times = torch.tensor([r[1] for r in results])
     print('Mean: %.4f    Std: %.4f' % (accs.mean(), accs.std()))
+    print('Train time mean: %.4f s    Std: %.4f s' % (train_times.mean().item(), train_times.std().item()))
 
     log = {'code': code, 'accs': accs}
     log_dir = os.path.join('logs', str(uuid.uuid4()))
