@@ -1,13 +1,26 @@
 # ESE 3060 Final Project Fall 2025
 ## PART 1 Relevant Submission Info
-- Ablations 1-6 of this project are stored in the part1_files folder. To run any ablation x, simply run
+- Ablations 1-6 of this project are stored in the /part1_files folder. To run any ablation x, simply run
 ```bash
 python ablation_[x].py
 ```
 - The raw logs of this project are stored in the /output_logs folder
-- Various dev files are stored in c10dev (these are not important to the runtime)
+- Various dev files are stored in /c10dev (these are not important to the runtime)
 
-# -------------------------- Everything below this was given --------------------------
+## PART 2 Relevant Submission Info
+- Ablations of this project are stored in the /part2_files folder. To run any ablation, use the same process as given. Ex:
+Download the data with 
+```bash
+python cached_fineweb10B.py 9
+```
+and then run the script with 
+```bash
+torchrun --standalone --nproc_per_node=8 train_gpt_lm_light_0.1.py
+```
+- The raw logs of this project are stored in the /output_logs folder
+- Various dev files are stored in /gptdev (these are not important to the runtime)
+
+# ------------ *Everything below this was given* ------------
 ## Project Overview
 This project contains two machine learning training benchmarks:
 - **airbench94.py**: CIFAR-10 image classification benchmark
@@ -73,4 +86,5 @@ torchrun --standalone --nproc_per_node=8 train_gpt.py
 - PyTorch 2.4.1+ with CUDA 12.1
 
 ### Reference
+
 Based on: [modded-nanogpt record number #5](https://github.com/KellerJordan/modded-nanogpt/blob/master/records/track_1_short/2024-10-14_ModernArch/dabaaddd-237c-4ec9-939d-6608a9ed5e27.txt)
