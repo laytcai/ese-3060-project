@@ -336,7 +336,7 @@ class Hyperparameters:
     save_every : int = 0 # every how many steps to save the checkpoint? 0 for only at the end
 
     # --- Sequence Length Warmup (SLW) ---
-    use_slw: bool = False # set True to enable short/medium/full phases
+    use_slw: bool = True # set True to enable short/medium/full phases
     slw_phase1_frac: float = 1.0 / 3.0
     slw_phase2_frac: float = 2.0 / 3.0
     slw_min_ratio: float = 0.25
@@ -351,6 +351,10 @@ ddp_local_rank = int(os.environ['LOCAL_RANK'])
 ddp_world_size = int(os.environ['WORLD_SIZE'])
 device = f'cuda:{ddp_local_rank}'
 torch.cuda.set_device(device)
+# enable TF32 where available for speed
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+torch.set_float32_matmul_precision('high')
 print(f"using device: {device}")
 master_process = (ddp_rank == 0) # this process will do logging, checkpointing etc.
 
@@ -378,7 +382,7 @@ model = GPT(GPTConfig(vocab_size=num_vocab, n_layer=12, n_head=6, n_embd=768))
 model = model.cuda()
 if hasattr(config, "coordinate_descent_tuning"):
     config.coordinate_descent_tuning = True # suggested by @Chillee
-model = torch.compile(model) # keep static shapes; SLW masks labels instead of cropping
+model = torch.compile(model, mode="reduce-overhead") # keep static shapes; SLW masks labels instead of cropping
 # here we wrap model into DDP container
 model = DDP(model, device_ids=[ddp_local_rank])
 raw_model = model.module # always contains the "raw" unwrapped model
@@ -430,6 +434,7 @@ torch.cuda.synchronize()
 t0 = time.time()
 # begin training
 train_loader.reset()
+mask_cache = {} # cache SLW masks per target_T to avoid per-step recreation
 for step in range(args.num_iterations + 1):
     last_step = (step == args.num_iterations)
     # This effectively ignores timing first 10 steps, which are slower for weird reasons.
@@ -501,7 +506,10 @@ for step in range(args.num_iterations + 1):
                 target_ratio = 1.0
             target_T = max(8, int(full_T * target_ratio))
             if target_T < full_T:
-                mask = torch.arange(full_T, device=y.device) >= target_T
+                cache_key = (y.device, target_T)
+                if cache_key not in mask_cache:
+                    mask_cache[cache_key] = (torch.arange(full_T, device=y.device) >= target_T)
+                mask = mask_cache[cache_key]
                 y_slw = y.clone()
                 y_slw[:, mask] = -1
 

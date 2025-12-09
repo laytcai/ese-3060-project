@@ -350,7 +350,7 @@ class Hyperparameters:
 
     # LayerDrop / dynamic depth settings
     # "none" (default) = disabled, "schedule" = depth warmup, "random" = stochastic LayerDrop
-    layerdrop_mode : str = "none"
+    layerdrop_mode : str = "random"
 
     # schedule / depth-warmup mode ("pure" layer drop)
     layerdrop_schedule_layers1 : int = 6
