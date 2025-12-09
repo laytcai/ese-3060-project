@@ -378,7 +378,7 @@ model = GPT(GPTConfig(vocab_size=num_vocab, n_layer=12, n_head=6, n_embd=768))
 model = model.cuda()
 if hasattr(config, "coordinate_descent_tuning"):
     config.coordinate_descent_tuning = True # suggested by @Chillee
-model = torch.compile(model, dynamic=True) # dynamic shapes to tolerate SLW cropping
+model = torch.compile(model) # keep static shapes; SLW masks labels instead of cropping
 # here we wrap model into DDP container
 model = DDP(model, device_ids=[ddp_local_rank])
 raw_model = model.module # always contains the "raw" unwrapped model
@@ -488,9 +488,10 @@ for step in range(args.num_iterations + 1):
     model.train()
     for i in range(1, train_accumulation_steps+1):
 
-        # Sequence Length Warmup (optional)
+        # Sequence Length Warmup (optional) via label masking (keeps shapes static)
+        y_slw = y
         if args.use_slw:
-            full_T = x.size(1)
+            full_T = y.size(1)
             frac = step / max(1, args.num_iterations)
             if frac < args.slw_phase1_frac:
                 target_ratio = args.slw_min_ratio
@@ -500,12 +501,13 @@ for step in range(args.num_iterations + 1):
                 target_ratio = 1.0
             target_T = max(8, int(full_T * target_ratio))
             if target_T < full_T:
-                x = x[:, :target_T].contiguous()
-                y = y[:, :target_T].contiguous()
+                mask = torch.arange(full_T, device=y.device) >= target_T
+                y_slw = y.clone()
+                y_slw[:, mask] = -1
 
         # forward pass
         with ctx:
-            _, loss = model(x, y, return_logits=False)
+            _, loss = model(x, y_slw, return_logits=False)
             train_loss = loss.detach()
         # advance the dataset for the next batch
         x, y = train_loader.next_batch()
