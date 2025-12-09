@@ -213,21 +213,11 @@ class GPT(nn.Module):
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
 
-    def forward(self, idx, targets=None, return_logits=True,
-                layerdrop_mask=None, max_active_layers=None):
+    def forward(self, idx, targets=None, return_logits=True):
 
         # forward the GPT model itself
         x = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        for layer_idx, block in enumerate(self.transformer.h):
-            # schedule / depth-warmup: limit to first K layers
-            if max_active_layers is not None and layer_idx >= max_active_layers:
-                break
-
-            # random LayerDrop: skip some layers according to mask
-            if layerdrop_mask is not None and layer_idx < len(layerdrop_mask):
-                if not layerdrop_mask[layer_idx]:
-                    continue
-
+        for block in self.transformer.h:
             x = block(x)
         x = F.rms_norm(x, (x.size(-1),))
 
@@ -345,25 +335,12 @@ class Hyperparameters:
     val_tokens : int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     save_every : int = 0 # every how many steps to save the checkpoint? 0 for only at the end
 
-    # model hyperparams
-    n_layer : int = 12  # number of transformer blocks
-
-    # LayerDrop / dynamic depth settings
-    # "none" (default) = disabled, "schedule" = depth warmup, "random" = stochastic LayerDrop
-    layerdrop_mode : str = "none"
-
-    # schedule / depth-warmup mode ("pure" layer drop)
-    layerdrop_schedule_layers1 : int = 6
-    layerdrop_schedule_step1   : int = 2000
-    layerdrop_schedule_layers2 : int = 9
-    layerdrop_schedule_step2   : int = 4000
-
-    # random LayerDrop mode
-    layerdrop_random_max_drop_prob : float = 0.2
-    layerdrop_random_keep_first_n  : int   = 2
-    layerdrop_random_keep_last_n   : int   = 2
-    layerdrop_random_decay_steps   : int   = 8000
-
+    # --- Sequence Length Warmup (SLW) ---
+    use_slw: bool = False # set True to enable short/medium/full phases
+    slw_phase1_frac: float = 1.0 / 3.0
+    slw_phase2_frac: float = 2.0 / 3.0
+    slw_min_ratio: float = 0.25
+    slw_mid_ratio: float = 0.50
 args = Hyperparameters()
 
 # set up DDP (distributed data parallel). torchrun sets this env variable
@@ -397,11 +374,11 @@ x, y = train_loader.next_batch()
 # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency. suggested to me by @Grad62304977.
 # this originates from Karpathy's experiments.
 num_vocab = 50304
-model = GPT(GPTConfig(vocab_size=num_vocab, n_layer=args.n_layer, n_head=6, n_embd=768))
+model = GPT(GPTConfig(vocab_size=num_vocab, n_layer=12, n_head=6, n_embd=768))
 model = model.cuda()
 if hasattr(config, "coordinate_descent_tuning"):
     config.coordinate_descent_tuning = True # suggested by @Chillee
-model = torch.compile(model)
+model = torch.compile(model, dynamic=True) # dynamic shapes to tolerate SLW cropping
 # here we wrap model into DDP container
 model = DDP(model, device_ids=[ddp_local_rank])
 raw_model = model.module # always contains the "raw" unwrapped model
@@ -426,52 +403,6 @@ def get_lr(it):
         decay_ratio = (args.num_iterations - it) / args.warmdown_iters
         return decay_ratio
 schedulers = [torch.optim.lr_scheduler.LambdaLR(opt, get_lr) for opt in optimizers]
-# LayerDrop / dynamic depth helper
-def make_layerdrop_kwargs(global_step, args, is_train: bool):
-    """
-    Returns kwargs to pass into model(...), implementing:
-      - args.layerdrop_mode == "schedule": depth warmup (pure layer drop)
-      - args.layerdrop_mode == "random": stochastic LayerDrop
-    If mode == "none" or not training, returns {}.
-    """
-    if (not is_train) or getattr(args, "layerdrop_mode", "none") == "none":
-        return {}
-
-    mode = args.layerdrop_mode
-
-    # 1) schedule mode: depth warmup
-    if mode == "schedule":
-        if global_step < args.layerdrop_schedule_step1:
-            max_layers = args.layerdrop_schedule_layers1
-        elif global_step < args.layerdrop_schedule_step2:
-            max_layers = args.layerdrop_schedule_layers2
-        else:
-            max_layers = args.n_layer
-        return {"max_active_layers": int(max_layers)}
-
-    # 2) random mode: stochastic LayerDrop
-    if mode == "random":
-        total = max(getattr(args, "layerdrop_random_decay_steps", 1), 1)
-        progress = min(global_step / total, 1.0)
-        drop_prob = args.layerdrop_random_max_drop_prob * (1.0 - progress)
-
-        num_layers = args.n_layer
-        keep_mask = []
-        for i in range(num_layers):
-            # always keep first and last few layers
-            if i < args.layerdrop_random_keep_first_n:
-                keep_mask.append(True)
-            elif i >= num_layers - args.layerdrop_random_keep_last_n:
-                keep_mask.append(True)
-            else:
-                keep = torch.rand(()) > drop_prob
-                keep_mask.append(bool(keep))
-
-        return {"layerdrop_mask": keep_mask}
-
-    # unknown mode -> no-op
-    return {}
-
 
 # begin logging
 if master_process:
@@ -556,10 +487,25 @@ for step in range(args.num_iterations + 1):
     # --------------- TRAINING SECTION BEGIN -----------------
     model.train()
     for i in range(1, train_accumulation_steps+1):
+
+        # Sequence Length Warmup (optional)
+        if args.use_slw:
+            full_T = x.size(1)
+            frac = step / max(1, args.num_iterations)
+            if frac < args.slw_phase1_frac:
+                target_ratio = args.slw_min_ratio
+            elif frac < args.slw_phase2_frac:
+                target_ratio = args.slw_mid_ratio
+            else:
+                target_ratio = 1.0
+            target_T = max(8, int(full_T * target_ratio))
+            if target_T < full_T:
+                x = x[:, :target_T].contiguous()
+                y = y[:, :target_T].contiguous()
+
         # forward pass
         with ctx:
-            extra_kwargs = make_layerdrop_kwargs(step, args, is_train=True)
-            _, loss = model(x, y, return_logits=False, **extra_kwargs)
+            _, loss = model(x, y, return_logits=False)
             train_loss = loss.detach()
         # advance the dataset for the next batch
         x, y = train_loader.next_batch()
@@ -569,11 +515,8 @@ for step in range(args.num_iterations + 1):
                 loss.backward()
         else:
             loss.backward() # just sync on the last step
-            
-    # scale gradients by the gradient accumulation steps
     for p in model.parameters():
-        if p.grad is not None:
-            p.grad /= train_accumulation_steps
+        p.grad /= train_accumulation_steps
     # step the optimizers and schedulers
     for opt, sched in zip(optimizers, schedulers):
         opt.step()
