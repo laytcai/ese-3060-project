@@ -4,7 +4,7 @@
 ```bash
 python ablation_[x].py
 ```
-- The raw logs of this project are stored in the /output_logs folder
+- The raw logs of this project are stored in the /logs_part1 folder
 - Various dev files are stored in /c10dev (these are not important to the runtime)
 
 ## PART 2 Relevant Submission Info
@@ -17,7 +17,7 @@ and then run the script with
 ```bash
 torchrun --standalone --nproc_per_node=8 train_gpt_lm_light_0.1.py
 ```
-- The raw logs of this project are stored in the /output_logs folder
+- The raw logs of this project are stored in the /logs_part2 folder
 - Various dev files are stored in /gptdev (these are not important to the runtime)
 
 # ------------ *Everything below this was given* ------------
@@ -88,3 +88,4 @@ torchrun --standalone --nproc_per_node=8 train_gpt.py
 ### Reference
 
 Based on: [modded-nanogpt record number #5](https://github.com/KellerJordan/modded-nanogpt/blob/master/records/track_1_short/2024-10-14_ModernArch/dabaaddd-237c-4ec9-939d-6608a9ed5e27.txt)
+
