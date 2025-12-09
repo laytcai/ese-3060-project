@@ -38,7 +38,7 @@ torch.backends.cudnn.benchmark = True
 
 hyp = {
     'opt': {
-        'train_epochs': 9.9,
+        'train_epochs': 10.5,
         'batch_size': 1024,
         'lr': 11.5,                 # learning rate per 1024 examples
         'momentum': 0.85,
@@ -46,6 +46,10 @@ hyp = {
         'bias_scaler': 64.0,        # scales up learning rate (but not weight decay) for BatchNorm biases
         'label_smoothing': 0.2,
         'whiten_bias_epochs': 3,    # how many epochs to train the whitening layer bias before freezing
+
+        # NEW: progressive freezing schedule (None = no freezing)
+        'freeze_block1_epoch': 6,
+        'freeze_block2_epoch': None,
     },
     'aug': {
         'flip': True,
@@ -217,24 +221,78 @@ def make_net():
     batchnorm_momentum = hyp['net']['batchnorm_momentum']
     whiten_kernel_size = 2
     whiten_width = 2 * 3 * whiten_kernel_size**2
+
     net = nn.Sequential(
+        # 0: whitening conv
         Conv(3, whiten_width, whiten_kernel_size, padding=0, bias=True),
+        # 1: GELU after whitening
         nn.GELU(),
-        ConvGroup(whiten_width,     widths['block1'], batchnorm_momentum),
+        # 2: block1
+        ConvGroup(whiten_width, widths['block1'], batchnorm_momentum),
+        # 3: block2
         ConvGroup(widths['block1'], widths['block2'], batchnorm_momentum),
+        # 4: block3
         ConvGroup(widths['block2'], widths['block3'], batchnorm_momentum),
+        # 5: final pooling
         nn.MaxPool2d(3),
+        # 6: flatten
         Flatten(),
+        # 7: classifier
         nn.Linear(widths['block3'], 10, bias=False),
+        # 8: scaling
         Mul(hyp['net']['scaling_factor']),
     )
+
+    # Whitening conv weights are never trained
     net[0].weight.requires_grad = False
+
+    # NEW: track how many ConvGroups are frozen (0, 1, or 2)
+    net.frozen_up_to = 0
+
+    # NEW: custom forward that runs frozen blocks under no_grad
+    def forward_with_freeze(inputs, _model=net):
+        train = _model.training
+
+        # whitening conv + GELU
+        x = _model[0](inputs)
+        x = _model[1](x)
+
+        # block1 = module index 2
+        if train and _model.frozen_up_to < 1:
+            x = _model[2](x)
+        else:
+            # run without tracking gradients / saving activations
+            with torch.no_grad():
+                x = _model[2](x)
+
+        # block2 = module index 3
+        if train and _model.frozen_up_to < 2:
+            x = _model[3](x)
+        else:
+            with torch.no_grad():
+                x = _model[3](x)
+
+        # block3 (index 4) stays trainable in this version
+        x = _model[4](x)
+
+        # head: pool → flatten → linear → scale
+        x = _model[5](x)
+        x = _model[6](x)
+        x = _model[7](x)
+        x = _model[8](x)
+        return x
+
+    # attach the new forward to this instance
+    net.forward = forward_with_freeze
+
+    # keep the original dtype / device / memory-format setup
     net = net.half().cuda()
     net = net.to(memory_format=torch.channels_last)
     for mod in net.modules():
         if isinstance(mod, BatchNorm):
             mod.float()
     return net
+
 
 #############################################
 #       Whitening Conv Initialization       #
@@ -371,6 +429,11 @@ def main(run):
     total_train_steps = ceil(len(train_loader) * epochs)
 
     model = make_net()
+
+    # NEW: freeze schedule from hyperparameters
+    freeze_block1_epoch = hyp['opt'].get('freeze_block1_epoch', None)
+    freeze_block2_epoch = hyp['opt'].get('freeze_block2_epoch', None)
+
     current_steps = 0
 
     norm_biases = [p for k, p in model.named_parameters() if 'norm' in k and p.requires_grad]
@@ -407,6 +470,17 @@ def main(run):
     total_time_seconds += 1e-3 * starter.elapsed_time(ender)
 
     for epoch in range(ceil(epochs)):
+
+        # NEW: freeze conv blocks according to the schedule (if set)
+        if freeze_block1_epoch is not None and epoch == int(freeze_block1_epoch):
+            model.frozen_up_to = max(model.frozen_up_to, 1)
+            for p in model[2].parameters():  # ConvGroup block1
+                p.requires_grad = False
+
+        if freeze_block2_epoch is not None and epoch == int(freeze_block2_epoch):
+            model.frozen_up_to = max(model.frozen_up_to, 2)
+            for p in model[3].parameters():  # ConvGroup block2
+                p.requires_grad = False
 
         model[0].bias.requires_grad = (epoch < hyp['opt']['whiten_bias_epochs'])
 
@@ -473,7 +547,7 @@ if __name__ == "__main__":
 
     print_columns(logging_columns_list, is_head=True)
     main('warmup')
-    results = [main(run) for run in range(2)]
+    results = [main(run) for run in range(25)]
     accs = torch.tensor([r[0] for r in results])
     train_times = torch.tensor([r[1] for r in results])
     print('Mean: %.4f    Std: %.4f' % (accs.mean(), accs.std()))

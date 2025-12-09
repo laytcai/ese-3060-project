@@ -46,6 +46,13 @@ hyp = {
         'bias_scaler': 64.0,        # scales up learning rate (but not weight decay) for BatchNorm biases
         'label_smoothing': 0.2,
         'whiten_bias_epochs': 3,    # how many epochs to train the whitening layer bias before freezing
+
+        # NEW: progressive freezing schedule (None = no freezing)
+        'freeze_block1_epoch': None,
+        'freeze_block2_epoch': None,
+
+        # NEW: LR boost for classifier head
+        'head_lr_multiplier': 1.5,
     },
     'aug': {
         'flip': True,
@@ -217,24 +224,78 @@ def make_net():
     batchnorm_momentum = hyp['net']['batchnorm_momentum']
     whiten_kernel_size = 2
     whiten_width = 2 * 3 * whiten_kernel_size**2
+
     net = nn.Sequential(
+        # 0: whitening conv
         Conv(3, whiten_width, whiten_kernel_size, padding=0, bias=True),
+        # 1: GELU after whitening
         nn.GELU(),
-        ConvGroup(whiten_width,     widths['block1'], batchnorm_momentum),
+        # 2: block1
+        ConvGroup(whiten_width, widths['block1'], batchnorm_momentum),
+        # 3: block2
         ConvGroup(widths['block1'], widths['block2'], batchnorm_momentum),
+        # 4: block3
         ConvGroup(widths['block2'], widths['block3'], batchnorm_momentum),
+        # 5: final pooling
         nn.MaxPool2d(3),
+        # 6: flatten
         Flatten(),
+        # 7: classifier
         nn.Linear(widths['block3'], 10, bias=False),
+        # 8: scaling
         Mul(hyp['net']['scaling_factor']),
     )
+
+    # Whitening conv weights are never trained
     net[0].weight.requires_grad = False
+
+    # NEW: track how many ConvGroups are frozen (0, 1, or 2)
+    net.frozen_up_to = 0
+
+    # NEW: custom forward that runs frozen blocks under no_grad
+    def forward_with_freeze(inputs, _model=net):
+        train = _model.training
+
+        # whitening conv + GELU
+        x = _model[0](inputs)
+        x = _model[1](x)
+
+        # block1 = module index 2
+        if train and _model.frozen_up_to < 1:
+            x = _model[2](x)
+        else:
+            # run without tracking gradients / saving activations
+            with torch.no_grad():
+                x = _model[2](x)
+
+        # block2 = module index 3
+        if train and _model.frozen_up_to < 2:
+            x = _model[3](x)
+        else:
+            with torch.no_grad():
+                x = _model[3](x)
+
+        # block3 (index 4) stays trainable in this version
+        x = _model[4](x)
+
+        # head: pool → flatten → linear → scale
+        x = _model[5](x)
+        x = _model[6](x)
+        x = _model[7](x)
+        x = _model[8](x)
+        return x
+
+    # attach the new forward to this instance
+    net.forward = forward_with_freeze
+
+    # keep the original dtype / device / memory-format setup
     net = net.half().cuda()
     net = net.to(memory_format=torch.channels_last)
     for mod in net.modules():
         if isinstance(mod, BatchNorm):
             mod.float()
     return net
+
 
 #############################################
 #       Whitening Conv Initialization       #
@@ -362,6 +423,9 @@ def main(run):
     wd = hyp['opt']['weight_decay'] * batch_size / kilostep_scale
     lr_biases = lr * hyp['opt']['bias_scaler']
 
+    head_lr_mult = hyp['opt'].get('head_lr_multiplier', 1.0)
+
+
     loss_fn = nn.CrossEntropyLoss(label_smoothing=hyp['opt']['label_smoothing'], reduction='none')
     test_loader = CifarLoader('cifar10', train=False, batch_size=2000)
     train_loader = CifarLoader('cifar10', train=True, batch_size=batch_size, aug=hyp['aug'])
@@ -371,23 +435,62 @@ def main(run):
     total_train_steps = ceil(len(train_loader) * epochs)
 
     model = make_net()
-    current_steps = 0
 
+    # NEW: freeze schedule from hyperparameters
+    freeze_block1_epoch = hyp['opt'].get('freeze_block1_epoch', None)
+    freeze_block2_epoch = hyp['opt'].get('freeze_block2_epoch', None)
+
+    # NEW: convert last freeze epoch → approximate step index
+    last_freeze_epoch = None
+    if freeze_block1_epoch is not None:
+        last_freeze_epoch = float(freeze_block1_epoch)
+    if freeze_block2_epoch is not None:
+        last_freeze_epoch = float(freeze_block2_epoch)
+    freeze_step = None
+    if last_freeze_epoch is not None:
+        freeze_step = int(total_train_steps * last_freeze_epoch / epochs)
+
+    current_steps = 0
     norm_biases = [p for k, p in model.named_parameters() if 'norm' in k and p.requires_grad]
-    other_params = [p for k, p in model.named_parameters() if 'norm' not in k and p.requires_grad]
-    param_configs = [dict(params=norm_biases, lr=lr_biases, weight_decay=wd/lr_biases),
-                     dict(params=other_params, lr=lr, weight_decay=wd/lr)]
+    head_params = list(model[7].parameters())
+    # NEW: compare by id() instead of tensor equality to avoid shape mismatch error
+    head_param_ids = {id(p) for p in head_params}
+    other_params = [
+        p for k, p in model.named_parameters()
+        if 'norm' not in k and p.requires_grad and id(p) not in head_param_ids
+    ]
+
+    param_configs = [
+        dict(params=norm_biases, lr=lr_biases,              weight_decay=wd / lr_biases),
+        dict(params=other_params, lr=lr,                    weight_decay=wd / lr),
+        dict(params=head_params,  lr=lr * head_lr_mult,     weight_decay=wd / (lr * head_lr_mult)),
+    ]
     optimizer = torch.optim.SGD(param_configs, momentum=momentum, nesterov=True)
 
     def get_lr(step):
         warmup_steps = int(total_train_steps * 0.23)
-        warmdown_steps = total_train_steps - warmup_steps
+
+        # If no freeze configured, or freeze is very early, fall back to original schedule
+        if freeze_step is None or freeze_step <= warmup_steps:
+            warmdown_steps = total_train_steps - warmup_steps
+            if step < warmup_steps:
+                frac = step / warmup_steps
+                return 0.2 * (1 - frac) + 1.0 * frac
+            else:
+                frac = (step - warmup_steps) / warmdown_steps
+                return 1.0 * (1 - frac) + 0.07 * frac
+
+        # With freezing: keep LR flat after warmup until freeze_step, then warmdown
         if step < warmup_steps:
             frac = step / warmup_steps
             return 0.2 * (1 - frac) + 1.0 * frac
+        elif step < freeze_step:
+            return 1.0
         else:
-            frac = (step - warmup_steps) / warmdown_steps
+            warmdown_steps2 = max(1, total_train_steps - freeze_step)
+            frac = (step - freeze_step) / warmdown_steps2
             return 1.0 * (1 - frac) + 0.07 * frac
+
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, get_lr)
 
     alpha_schedule = 0.95**5 * (torch.arange(total_train_steps+1) / total_train_steps)**3
@@ -407,6 +510,17 @@ def main(run):
     total_time_seconds += 1e-3 * starter.elapsed_time(ender)
 
     for epoch in range(ceil(epochs)):
+
+        # NEW: freeze conv blocks according to the schedule (if set)
+        if freeze_block1_epoch is not None and epoch == int(freeze_block1_epoch):
+            model.frozen_up_to = max(model.frozen_up_to, 1)
+            for p in model[2].parameters():  # ConvGroup block1
+                p.requires_grad = False
+
+        if freeze_block2_epoch is not None and epoch == int(freeze_block2_epoch):
+            model.frozen_up_to = max(model.frozen_up_to, 2)
+            for p in model[3].parameters():  # ConvGroup block2
+                p.requires_grad = False
 
         model[0].bias.requires_grad = (epoch < hyp['opt']['whiten_bias_epochs'])
 
@@ -455,7 +569,6 @@ def main(run):
     #  TTA Evaluation  #
     ####################
 
-    train_time_seconds = total_time_seconds
     starter.record()
     tta_val_acc = evaluate(model, test_loader, tta_level=hyp['net']['tta_level'])
     ender.record()
@@ -465,7 +578,7 @@ def main(run):
     epoch = 'eval'
     print_training_details(locals(), is_final_entry=True)
 
-    return tta_val_acc, train_time_seconds
+    return tta_val_acc
 
 if __name__ == "__main__":
     with open(sys.argv[0]) as f:
@@ -473,11 +586,8 @@ if __name__ == "__main__":
 
     print_columns(logging_columns_list, is_head=True)
     main('warmup')
-    results = [main(run) for run in range(2)]
-    accs = torch.tensor([r[0] for r in results])
-    train_times = torch.tensor([r[1] for r in results])
+    accs = torch.tensor([main(run) for run in range(25)])
     print('Mean: %.4f    Std: %.4f' % (accs.mean(), accs.std()))
-    print('Train time mean: %.4f s    Std: %.4f s' % (train_times.mean().item(), train_times.std().item()))
 
     log = {'code': code, 'accs': accs}
     log_dir = os.path.join('logs', str(uuid.uuid4()))
@@ -485,3 +595,4 @@ if __name__ == "__main__":
     log_path = os.path.join(log_dir, 'log.pt')
     print(os.path.abspath(log_path))
     torch.save(log, os.path.join(log_dir, 'log.pt'))
+
