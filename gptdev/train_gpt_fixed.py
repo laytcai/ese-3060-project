@@ -8,6 +8,7 @@ import uuid
 import glob
 import time
 from dataclasses import dataclass
+from tqdm import tqdm
 
 import numpy as np
 import torch
@@ -319,8 +320,8 @@ class DistributedDataLoader:
 @dataclass
 class Hyperparameters:
     # data hyperparams
-    input_bin : str = 'data/fineweb10B/fineweb_train_*.bin' # input .bin to train on
-    input_val_bin : str = 'data/fineweb10B/fineweb_val_*.bin' # input .bin to eval validation loss on
+    input_bin : str = '../fineweb10B/fineweb_train_*.bin' # input .bin to train on
+    input_val_bin : str = '../fineweb10B/fineweb_val_*.bin' # input .bin to eval validation loss on
     # optimization hyperparams
     batch_size : int = 8*64 # batch size, in sequences, across all devices
     device_batch_size : int = 64 # batch size, in sequences, per device
@@ -423,6 +424,7 @@ torch.cuda.synchronize()
 t0 = time.time()
 # begin training
 train_loader.reset()
+pbar = tqdm(total=args.num_iterations + 1, disable=not master_process, dynamic_ncols=True)
 for step in range(args.num_iterations + 1):
     last_step = (step == args.num_iterations)
     # This effectively ignores timing first 10 steps, which are slower for weird reasons.
@@ -470,12 +472,15 @@ for step in range(args.num_iterations + 1):
         torch.cuda.synchronize()
         t0 = time.time()
 
+    if last_step:
+        if master_process:
+            pbar.update(1)
+        break
+
     # bit confusing: we want to make sure to eval on 0th iteration
     # but also after the very last iteration. so we loop for step <= num_iterations
     # instead of just < num_iterations (one extra due to <=), only to do
     # the validation/sampling one last time, and then we break right here as we're done.
-    if last_step:
-        break
 
     # --------------- TRAINING SECTION BEGIN -----------------
     model.train()
@@ -509,6 +514,8 @@ for step in range(args.num_iterations + 1):
         print(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms")
         with open(logfile, "a") as f:
             f.write(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms\n")
+        pbar.update(1)
 
 if master_process:
+    pbar.close()
     print(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
