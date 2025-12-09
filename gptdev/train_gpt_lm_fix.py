@@ -218,13 +218,12 @@ class GPT(nn.Module):
         # token embeddings: (B, T, C)
         x = self.transformer.wte(idx)
 
-        # we'll grab intermediate hidden states for deep supervision
+        # grab hidden states at layer 4 and 8 for deep supervision
         h4 = None
         h8 = None
-
         for i, block in enumerate(self.transformer.h):
             x = block(x)
-            # i is 0-based -> i==3 => layer 4, i==7 => layer 8
+            # i is 0-based -> i==3 => 4th layer, i==7 => 8th layer
             if i == 3:
                 h4 = x
             elif i == 7:
@@ -234,7 +233,7 @@ class GPT(nn.Module):
         x = F.rms_norm(x, (x.size(-1),))
 
         if targets is not None:
-            # ===== main loss on ALL tokens (baseline behavior) =====
+            # ----- main (baseline) loss on ALL tokens -----
             logits = self.lm_head(x)          # (B, T, V)
             logits = logits.float()
             loss_main = F.cross_entropy(
@@ -243,44 +242,47 @@ class GPT(nn.Module):
                 ignore_index=-1,
             )
 
-            # ===== lightweight deep supervision =====
-            # only use the LAST token for the intermediate heads, to keep it cheap
+            if self.training:
+                # ===== deep supervision is *training-only* =====
+                # last-token targets: (B,)
+                targets_last = targets[:, -1]
 
-            # last-token targets: (B,)
-            targets_last = targets[:, -1]
+                # layer 4 last token: (B, C)
+                h4_last = h4[:, -1, :]
+                h4_last = F.rms_norm(h4_last, (h4_last.size(-1),))
+                logits4_last = self.lm_head(h4_last).float()  # (B, V)
+                loss4 = F.cross_entropy(
+                    logits4_last,
+                    targets_last,
+                    ignore_index=-1,
+                )
 
-            # layer 4 last token: (B, C)
-            h4_last = h4[:, -1, :]
-            h4_last = F.rms_norm(h4_last, (h4_last.size(-1),))
-            logits4_last = self.lm_head(h4_last).float()  # (B, V)
-            loss4 = F.cross_entropy(
-                logits4_last,
-                targets_last,
-                ignore_index=-1,
-            )
+                # layer 8 last token: (B, C)
+                h8_last = h8[:, -1, :]
+                h8_last = F.rms_norm(h8_last, (h8_last.size(-1),))
+                logits8_last = self.lm_head(h8_last).float()  # (B, V)
+                loss8 = F.cross_entropy(
+                    logits8_last,
+                    targets_last,
+                    ignore_index=-1,
+                )
 
-            # layer 8 last token: (B, C)
-            h8_last = h8[:, -1, :]
-            h8_last = F.rms_norm(h8_last, (h8_last.size(-1),))
-            logits8_last = self.lm_head(h8_last).float()  # (B, V)
-            loss8 = F.cross_entropy(
-                logits8_last,
-                targets_last,
-                ignore_index=-1,
-            )
+                # small weights so final layer still dominates
+                lambda4 = 0.05
+                lambda8 = 0.05
 
-            # small weights so the final layer still dominates
-            lambda4 = 0.05
-            lambda8 = 0.05
-
-            loss = (
-                (1.0 - lambda4 - lambda8) * loss_main
-                + lambda4 * loss4
-                + lambda8 * loss8
-            )
+                # training loss (used for backprop)
+                loss = (
+                    (1.0 - lambda4 - lambda8) * loss_main
+                    + lambda4 * loss4
+                    + lambda8 * loss8
+                )
+            else:
+                # EVAL MODE: use ONLY the baseline loss
+                loss = loss_main
 
         else:
-            # inference-time mini-optimization: only last position
+            # inference-time optimization: only last position
             logits = self.lm_head(x[:, [-1], :])  # (B, 1, V)
             logits = logits.float()
             loss = None
@@ -289,6 +291,7 @@ class GPT(nn.Module):
             logits = None
 
         return logits, loss
+
 
 
 
