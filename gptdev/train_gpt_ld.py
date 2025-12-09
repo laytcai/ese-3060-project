@@ -403,7 +403,11 @@ if hasattr(config, "coordinate_descent_tuning"):
     config.coordinate_descent_tuning = True # suggested by @Chillee
 model = torch.compile(model)
 # here we wrap model into DDP container
-model = DDP(model, device_ids=[ddp_local_rank])
+model = DDP(
+    model,
+    device_ids=[ddp_local_rank],
+    find_unused_parameters=True,  # <-- allow LayerDrop to skip blocks
+)
 raw_model = model.module # always contains the "raw" unwrapped model
 ctx = torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16)
 
