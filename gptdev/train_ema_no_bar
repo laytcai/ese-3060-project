@@ -336,7 +336,7 @@ class Hyperparameters:
     save_every : int = 0 # every how many steps to save the checkpoint? 0 for only at the end
     # NEW - EMA Hyperparams
     use_ema : bool = True
-    ema_decay : float = 0.9999
+    ema_decay : float = 0.995  # edit this for ablations
 args = Hyperparameters()
 
 # set up DDP (distributed data parallel). torchrun sets this env variable
