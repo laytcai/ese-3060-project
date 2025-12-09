@@ -201,22 +201,19 @@ class GPTConfig:
     n_embd : int = 768
 
 class GPT(nn.Module):
-
     def __init__(self, config):
         super().__init__()
         self.config = config
-
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-        self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
+        self.transformer.wte.weight = self.lm_head.weight  # https://paperswithcode.com/method/weight-tying
 
     def forward(self, idx, targets=None, return_logits=True):
-
         # forward the GPT model itself
-        x = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
+        x = self.transformer.wte(idx)  # token embeddings of shape (b, t, n_embd)
         for block in self.transformer.h:
             x = block(x)
         x = F.rms_norm(x, (x.size(-1),))
@@ -224,12 +221,32 @@ class GPT(nn.Module):
         if targets is not None:
             # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x)
-            logits = logits.float() # use tf32/fp32 for logits
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+            logits = logits.float()  # use tf32/fp32 for logits
+
+            # standard cross-entropy loss
+            loss = F.cross_entropy(
+                logits.view(-1, logits.size(-1)),
+                targets.view(-1),
+                ignore_index=-1,
+            )
+
+            # ---------------- z-loss addition (PaLM-style) ----------------
+            z_loss_coef = 1e-4  # you can tune this if you want
+
+            # logZ over vocabulary dimension -> shape [B, T]
+            logZ = torch.logsumexp(logits, dim=-1)
+
+            # if you ever have padding with target == -1, mask those out
+            mask = (targets != -1).float()
+            if mask.sum() > 0:
+                z_loss = ((logZ ** 2) * mask).sum() / mask.sum()
+                loss = loss + z_loss_coef * z_loss
+            # --------------------------------------------------------------
+
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
-            logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
-            logits = logits.float() # use tf32/fp32 for logits
+            logits = self.lm_head(x[:, [-1], :])  # note: using list [-1] to preserve the time dim
+            logits = logits.float()  # use tf32/fp32 for logits
             loss = None
 
         # there are performance reasons why not returning logits is prudent, if not needed
@@ -237,6 +254,7 @@ class GPT(nn.Module):
             logits = None
 
         return logits, loss
+
 
 # -----------------------------------------------------------------------------
 # Our own simple Distributed Data Loader

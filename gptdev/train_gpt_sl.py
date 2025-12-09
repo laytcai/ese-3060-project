@@ -334,6 +334,19 @@ class Hyperparameters:
     val_loss_every : int = 125 # every how many steps to evaluate val loss? 0 for only at the end
     val_tokens : int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     save_every : int = 0 # every how many steps to save the checkpoint? 0 for only at the end
+
+    # --- Sequence Length Warmup (SLW) ---
+    # Turn SLW on/off (set to True when running your SLW experiments)
+    use_slw: bool = False
+
+    # Fraction of total training steps where we stay in "short" and "medium" phases
+    slw_phase1_frac: float = 1.0 / 3.0   # 0%   -> 33% of training
+    slw_phase2_frac: float = 2.0 / 3.0   # 33%  -> 66% of training
+
+    # How short the sequences are in each phase (relative to full length)
+    slw_min_ratio: float = 0.25          # early phase: 25% of full sequence length
+    slw_mid_ratio: float = 0.50          # middle phase: 50% of full sequence length
+
 args = Hyperparameters()
 
 # set up DDP (distributed data parallel). torchrun sets this env variable
@@ -480,11 +493,39 @@ for step in range(args.num_iterations + 1):
     # --------------- TRAINING SECTION BEGIN -----------------
     model.train()
     for i in range(1, train_accumulation_steps+1):
+
+        # ------------------------------------------------------------------
+        # Sequence Length Warmup (SLW): optionally use shorter sequences early
+        # ------------------------------------------------------------------
+        if args.use_slw:
+            # current (full) sequence length from the dataloader
+            full_T = x.size(1)
+
+            # fraction of training completed in [0, 1]
+            frac = step / max(1, args.num_iterations)
+
+            # decide target ratio based on training phase
+            if frac < args.slw_phase1_frac:
+                target_ratio = args.slw_min_ratio       # early: very short sequences
+            elif frac < args.slw_phase2_frac:
+                target_ratio = args.slw_mid_ratio       # middle: medium sequences
+            else:
+                target_ratio = 1.0                      # late: full length
+
+            # compute target sequence length and ensure it's at least 8 tokens
+            target_T = max(8, int(full_T * target_ratio))
+
+            # if target_T < full_T we crop the sequence dimension
+            if target_T < full_T:
+                x = x[:, :target_T].contiguous()
+                y = y[:, :target_T].contiguous()
+        # ------------------------------------------------------------------
+
         # forward pass
         with ctx:
             _, loss = model(x, y, return_logits=False)
             train_loss = loss.detach()
-        # advance the dataset for the next batch
+        # advance the dataset for the next batch (will be cropped on next loop iter if SLW on)
         x, y = train_loader.next_batch()
         # backward pass
         if i < train_accumulation_steps:
@@ -501,6 +542,7 @@ for step in range(args.num_iterations + 1):
     # null the gradients
     model.zero_grad(set_to_none=True)
     # --------------- TRAINING SECTION END -------------------
+
     # everything that follows now is just diagnostics, prints, logging, etc.
 
     #dist.all_reduce(train_loss, op=dist.ReduceOp.AVG) # all-reducing the training loss would be more correct in terms of logging, but slower

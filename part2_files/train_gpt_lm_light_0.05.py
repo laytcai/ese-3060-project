@@ -17,6 +17,14 @@ import torch.distributed as dist
 import torch._inductor.config as config
 from torch.nn.parallel import DistributedDataParallel as DDP
 
+import warnings
+
+warnings.filterwarnings(
+    "ignore",
+    message="Online softmax is disabled on the fly since Inductor decides to split the reduction.*",
+    category=UserWarning,
+)
+
 # -----------------------------------------------------------------------------
 # Muon optimizer
 
@@ -211,32 +219,89 @@ class GPT(nn.Module):
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-        self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
+        # weight tying
+        self.transformer.wte.weight = self.lm_head.weight
 
     def forward(self, idx, targets=None, return_logits=True):
+        # token embeddings: (B, T, C)
+        x = self.transformer.wte(idx)
 
-        # forward the GPT model itself
-        x = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        for block in self.transformer.h:
+        # grab hidden states at layer 4 and 8 for deep supervision
+        h4 = None
+        h8 = None
+        for i, block in enumerate(self.transformer.h):
             x = block(x)
+            # i is 0-based -> i==3 => 4th layer, i==7 => 8th layer
+            if i == 3:
+                h4 = x
+            elif i == 7:
+                h8 = x
+
+        # final RMSNorm (same as baseline)
         x = F.rms_norm(x, (x.size(-1),))
 
         if targets is not None:
-            # if we are given some desired targets also calculate the loss
-            logits = self.lm_head(x)
-            logits = logits.float() # use tf32/fp32 for logits
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+            # ----- main (baseline) loss on ALL tokens -----
+            logits = self.lm_head(x)          # (B, T, V)
+            logits = logits.float()
+            loss_main = F.cross_entropy(
+                logits.view(-1, logits.size(-1)),
+                targets.view(-1),
+                ignore_index=-1,
+            )
+
+            if self.training:
+                # ===== deep supervision is *training-only* =====
+                # last-token targets: (B,)
+                targets_last = targets[:, -1]
+
+                # layer 4 last token: (B, C)
+                h4_last = h4[:, -1, :]
+                h4_last = F.rms_norm(h4_last, (h4_last.size(-1),))
+                logits4_last = self.lm_head(h4_last).float()  # (B, V)
+                loss4 = F.cross_entropy(
+                    logits4_last,
+                    targets_last,
+                    ignore_index=-1,
+                )
+
+                # layer 8 last token: (B, C)
+                h8_last = h8[:, -1, :]
+                h8_last = F.rms_norm(h8_last, (h8_last.size(-1),))
+                logits8_last = self.lm_head(h8_last).float()  # (B, V)
+                loss8 = F.cross_entropy(
+                    logits8_last,
+                    targets_last,
+                    ignore_index=-1,
+                )
+
+                # small weights so final layer still dominates
+                lambda4 = 0.05
+                lambda8 = 0.05
+
+                # training loss (used for backprop)
+                loss = (
+                    (1.0 - lambda4 - lambda8) * loss_main
+                    + lambda4 * loss4
+                    + lambda8 * loss8
+                )
+            else:
+                # EVAL MODE: use ONLY the baseline loss
+                loss = loss_main
+
         else:
-            # inference-time mini-optimization: only forward the lm_head on the very last position
-            logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
-            logits = logits.float() # use tf32/fp32 for logits
+            # inference-time optimization: only last position
+            logits = self.lm_head(x[:, [-1], :])  # (B, 1, V)
+            logits = logits.float()
             loss = None
 
-        # there are performance reasons why not returning logits is prudent, if not needed
         if not return_logits:
             logits = None
 
         return logits, loss
+
+
+
 
 # -----------------------------------------------------------------------------
 # Our own simple Distributed Data Loader

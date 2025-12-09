@@ -111,19 +111,28 @@ class Rotary(torch.nn.Module):
 
     def __init__(self, dim, base=10000):
         super().__init__()
-        self.inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
+        self.register_buffer("inv_freq", 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim)))
         self.seq_len_cached = None
         self.cos_cached = None
         self.sin_cached = None
 
-    def forward(self, x):
-        seq_len = x.shape[1]
-        if seq_len != self.seq_len_cached:
-            self.seq_len_cached = seq_len
-            t = torch.arange(seq_len, device=x.device).type_as(self.inv_freq)
-            freqs = torch.outer(t, self.inv_freq).to(x.device)
+    def preload(self, seq_len, device):
+        with torch.no_grad():
+            t = torch.arange(seq_len, device=device, dtype=self.inv_freq.dtype)
+            freqs = torch.outer(t, self.inv_freq.to(device))
             self.cos_cached = freqs.cos().bfloat16()
             self.sin_cached = freqs.sin().bfloat16()
+            self.seq_len_cached = seq_len
+
+    def forward(self, x):
+        seq_len = x.shape[1]
+        if (
+            self.cos_cached is None
+            or self.sin_cached is None
+            or self.seq_len_cached != seq_len
+            or self.cos_cached.device != x.device
+        ):
+            raise RuntimeError("Rotary cache not preloaded or wrong device. Call preload() before compile.")
         return self.cos_cached[None, :, None, :], self.sin_cached[None, :, None, :]
 
 def apply_rotary_emb(x, cos, sin):
@@ -334,6 +343,13 @@ class Hyperparameters:
     val_loss_every : int = 125 # every how many steps to evaluate val loss? 0 for only at the end
     val_tokens : int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     save_every : int = 0 # every how many steps to save the checkpoint? 0 for only at the end
+
+    # --- Sequence Length Warmup (SLW) ---
+    use_slw: bool = True # set True to enable short/medium/full phases
+    slw_phase1_frac: float = 1.0 / 3.0
+    slw_phase2_frac: float = 2.0 / 3.0
+    slw_min_ratio: float = 0.25
+    slw_mid_ratio: float = 0.50
 args = Hyperparameters()
 
 # set up DDP (distributed data parallel). torchrun sets this env variable
@@ -344,6 +360,10 @@ ddp_local_rank = int(os.environ['LOCAL_RANK'])
 ddp_world_size = int(os.environ['WORLD_SIZE'])
 device = f'cuda:{ddp_local_rank}'
 torch.cuda.set_device(device)
+# enable TF32 where available for speed
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+torch.set_float32_matmul_precision('high')
 print(f"using device: {device}")
 master_process = (ddp_rank == 0) # this process will do logging, checkpointing etc.
 
@@ -371,7 +391,10 @@ model = GPT(GPTConfig(vocab_size=num_vocab, n_layer=12, n_head=6, n_embd=768))
 model = model.cuda()
 if hasattr(config, "coordinate_descent_tuning"):
     config.coordinate_descent_tuning = True # suggested by @Chillee
-model = torch.compile(model)
+# preload rotary caches before compile to avoid in-graph mutations
+for blk in model.transformer.h:
+    blk.attn.rotary.preload(T, device)
+model = torch.compile(model, mode="reduce-overhead") # keep static shapes; SLW masks labels instead of cropping
 # here we wrap model into DDP container
 model = DDP(model, device_ids=[ddp_local_rank])
 raw_model = model.module # always contains the "raw" unwrapped model
@@ -423,6 +446,7 @@ torch.cuda.synchronize()
 t0 = time.time()
 # begin training
 train_loader.reset()
+mask_cache = {} # cache SLW masks per target_T to avoid per-step recreation
 for step in range(args.num_iterations + 1):
     last_step = (step == args.num_iterations)
     # This effectively ignores timing first 10 steps, which are slower for weird reasons.
@@ -444,6 +468,7 @@ for step in range(args.num_iterations + 1):
         val_loss = 0.0
         for _ in range(val_steps):
             x_val, y_val = val_loader.next_batch()
+            torch.compiler.cudagraph_mark_step_begin()
             with ctx: # of course, we'd like to use no_grad() here too, but that creates a torch.compile error for some reason
                 _, loss = model(x_val, y_val, return_logits=False)
                 val_loss += loss.detach()
@@ -480,9 +505,31 @@ for step in range(args.num_iterations + 1):
     # --------------- TRAINING SECTION BEGIN -----------------
     model.train()
     for i in range(1, train_accumulation_steps+1):
+
+        # Sequence Length Warmup (optional) via label masking (keeps shapes static)
+        y_slw = y
+        if args.use_slw:
+            full_T = y.size(1)
+            frac = step / max(1, args.num_iterations)
+            if frac < args.slw_phase1_frac:
+                target_ratio = args.slw_min_ratio
+            elif frac < args.slw_phase2_frac:
+                target_ratio = args.slw_mid_ratio
+            else:
+                target_ratio = 1.0
+            target_T = max(8, int(full_T * target_ratio))
+            if target_T < full_T:
+                cache_key = (y.device, target_T)
+                if cache_key not in mask_cache:
+                    mask_cache[cache_key] = (torch.arange(full_T, device=y.device) >= target_T)
+                mask = mask_cache[cache_key]
+                y_slw = y.clone()
+                y_slw[:, mask] = -1
+
         # forward pass
+        torch.compiler.cudagraph_mark_step_begin()
         with ctx:
-            _, loss = model(x, y, return_logits=False)
+            _, loss = model(x, y_slw, return_logits=False)
             train_loss = loss.detach()
         # advance the dataset for the next batch
         x, y = train_loader.next_batch()

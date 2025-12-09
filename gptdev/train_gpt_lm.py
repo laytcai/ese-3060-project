@@ -217,15 +217,59 @@ class GPT(nn.Module):
 
         # forward the GPT model itself
         x = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        for block in self.transformer.h:
+
+        # we'll grab intermediate hidden states for deep supervision
+        h4 = None
+        h8 = None
+
+        for i, block in enumerate(self.transformer.h):
             x = block(x)
+            # i is 0-based, so i==3 is layer 4, i==7 is layer 8
+            if i == 3:
+                h4 = x
+            elif i == 7:
+                h8 = x
+
+        # final layernorm before the main head
         x = F.rms_norm(x, (x.size(-1),))
 
         if targets is not None:
-            # if we are given some desired targets also calculate the loss
+            # main (final-layer) logits and loss
             logits = self.lm_head(x)
             logits = logits.float() # use tf32/fp32 for logits
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+            loss_main = F.cross_entropy(
+                logits.view(-1, logits.size(-1)),
+                targets.view(-1),
+                ignore_index=-1,
+            )
+
+            # ----- deep supervision losses -----
+            # normalize intermediate states the same way as final
+            h4_ln = F.rms_norm(h4, (h4.size(-1),))
+            h8_ln = F.rms_norm(h8, (h8.size(-1),))
+
+            logits4 = self.lm_head(h4_ln).float()
+            logits8 = self.lm_head(h8_ln).float()
+
+            loss4 = F.cross_entropy(
+                logits4.view(-1, logits4.size(-1)),
+                targets.view(-1),
+                ignore_index=-1,
+            )
+            loss8 = F.cross_entropy(
+                logits8.view(-1, logits8.size(-1)),
+                targets.view(-1),
+                ignore_index=-1,
+            )
+
+            # weights for intermediate losses (you can tune these)
+            lambda4 = 0.1
+            lambda8 = 0.1
+
+            loss = (1.0 - lambda4 - lambda8) * loss_main \
+                   + lambda4 * loss4 \
+                   + lambda8 * loss8
+
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
@@ -237,6 +281,7 @@ class GPT(nn.Module):
             logits = None
 
         return logits, loss
+
 
 # -----------------------------------------------------------------------------
 # Our own simple Distributed Data Loader
