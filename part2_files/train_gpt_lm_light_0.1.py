@@ -276,8 +276,8 @@ class GPT(nn.Module):
                 )
 
                 # small weights so final layer still dominates
-                lambda4 = 0.05
-                lambda8 = 0.05
+                lambda4 = 0.1
+                lambda8 = 0.1
 
                 # training loss (used for backprop)
                 loss = (
