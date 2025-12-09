@@ -111,33 +111,21 @@ class Rotary(torch.nn.Module):
 
     def __init__(self, dim, base=10000):
         super().__init__()
-        self.register_buffer(
-            "inv_freq",
-            1.0 / (base ** (torch.arange(0, dim, 2).float() / dim)),
-            persistent=False,
-        )
+        self.inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
         self.seq_len_cached = None
         self.cos_cached = None
         self.sin_cached = None
 
-    def preload(self, seq_len, device):
-        with torch.no_grad():
-            t = torch.arange(seq_len, device=device, dtype=self.inv_freq.dtype)
-            freqs = torch.outer(t, self.inv_freq.to(device))
-            self.cos_cached = freqs.cos().bfloat16()
-            self.sin_cached = freqs.sin().bfloat16()
-            self.seq_len_cached = seq_len
-
     def forward(self, x):
         seq_len = x.shape[1]
-        if (
-            self.cos_cached is None
-            or self.sin_cached is None
-            or self.seq_len_cached != seq_len
-            or self.cos_cached.device != x.device
-        ):
-            # fallback (should be preloaded before compile)
-            self.preload(seq_len, x.device)
+        if seq_len != self.seq_len_cached:
+            self.seq_len_cached = seq_len
+            if self.inv_freq.device != x.device:
+                self.inv_freq = self.inv_freq.to(x.device)
+            t = torch.arange(seq_len, device=x.device, dtype=self.inv_freq.dtype)
+            freqs = torch.outer(t, self.inv_freq)
+            self.cos_cached = freqs.cos().bfloat16()
+            self.sin_cached = freqs.sin().bfloat16()
         return self.cos_cached[None, :, None, :], self.sin_cached[None, :, None, :]
 
 def apply_rotary_emb(x, cos, sin):
@@ -396,10 +384,7 @@ model = GPT(GPTConfig(vocab_size=num_vocab, n_layer=12, n_head=6, n_embd=768))
 model = model.cuda()
 if hasattr(config, "coordinate_descent_tuning"):
     config.coordinate_descent_tuning = True # suggested by @Chillee
-# precompute rotary caches on this device to keep cudagraphs static
-for blk in model.transformer.h:
-    blk.attn.rotary.preload(args.sequence_length, device)
-model = torch.compile(model, mode="reduce-overhead") # favor cudagraph capture for steady-state speed
+model = torch.compile(model, mode="reduce-overhead") # keep static shapes; SLW masks labels instead of cropping
 # here we wrap model into DDP container
 model = DDP(model, device_ids=[ddp_local_rank])
 raw_model = model.module # always contains the "raw" unwrapped model
@@ -473,7 +458,6 @@ for step in range(args.num_iterations + 1):
         val_loss = 0.0
         for _ in range(val_steps):
             x_val, y_val = val_loader.next_batch()
-            torch.compiler.cudagraph_mark_step_begin()
             with ctx: # of course, we'd like to use no_grad() here too, but that creates a torch.compile error for some reason
                 _, loss = model(x_val, y_val, return_logits=False)
                 val_loss += loss.detach()
@@ -532,7 +516,6 @@ for step in range(args.num_iterations + 1):
                 y_slw[:, mask] = -1
 
         # forward pass
-        torch.compiler.cudagraph_mark_step_begin()
         with ctx:
             _, loss = model(x, y_slw, return_logits=False)
             train_loss = loss.detach()
