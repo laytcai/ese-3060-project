@@ -386,7 +386,7 @@ model = GPT(GPTConfig(vocab_size=num_vocab, n_layer=12, n_head=6, n_embd=768))
 model = model.cuda()
 if hasattr(config, "coordinate_descent_tuning"):
     config.coordinate_descent_tuning = True # suggested by @Chillee
-model = torch.compile(model, mode="reduce-overhead") # keep static shapes; SLW masks labels instead of cropping
+model = torch.compile(model) # keep default compile; cudagraphs marked per step
 # here we wrap model into DDP container
 model = DDP(model, device_ids=[ddp_local_rank])
 raw_model = model.module # always contains the "raw" unwrapped model
@@ -460,6 +460,7 @@ for step in range(args.num_iterations + 1):
         val_loss = 0.0
         for _ in range(val_steps):
             x_val, y_val = val_loader.next_batch()
+            torch.compiler.cudagraph_mark_step_begin()
             with ctx: # of course, we'd like to use no_grad() here too, but that creates a torch.compile error for some reason
                 _, loss = model(x_val, y_val, return_logits=False)
                 val_loss += loss.detach()
@@ -518,6 +519,7 @@ for step in range(args.num_iterations + 1):
                 y_slw[:, mask] = -1
 
         # forward pass
+        torch.compiler.cudagraph_mark_step_begin()
         with ctx:
             _, loss = model(x, y_slw, return_logits=False)
             train_loss = loss.detach()
