@@ -1,5 +1,13 @@
 # ESE 3060 Final Project Fall 2025
+## PART 1 Relevant Submission Info
+- Ablations 1-6 of this project are stored in the part1_files folder. To run any ablation x, simply run
+```bash
+python ablation_[x].py
+```
+- The raw logs of this project are stored in the /output_logs folder
+- Various dev files are stored in c10dev (these are not important to the runtime)
 
+# -------------------------- Everything below this was given --------------------------
 ## Project Overview
 This project contains two machine learning training benchmarks:
 - **airbench94.py**: CIFAR-10 image classification benchmark
