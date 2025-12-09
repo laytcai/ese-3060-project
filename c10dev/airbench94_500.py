@@ -11,6 +11,7 @@
 #            Setup/Hyperparameters          #
 #############################################
 
+import json
 import os
 import sys
 import uuid
@@ -350,6 +351,8 @@ def evaluate(model, loader, tta_level=0):
 
 def main(run):
 
+    run_id = run
+
     batch_size = hyp['opt']['batch_size']
     epochs = hyp['opt']['train_epochs']
     momentum = hyp['opt']['momentum']
@@ -455,7 +458,6 @@ def main(run):
     #  TTA Evaluation  #
     ####################
 
-    train_time_seconds = total_time_seconds
     starter.record()
     tta_val_acc = evaluate(model, test_loader, tta_level=hyp['net']['tta_level'])
     ender.record()
@@ -465,23 +467,74 @@ def main(run):
     epoch = 'eval'
     print_training_details(locals(), is_final_entry=True)
 
-    return tta_val_acc, train_time_seconds
+    return {
+        'run': run_id,
+        'train_loss': float(train_loss),
+        'train_acc': float(train_acc),
+        'val_acc': float(val_acc),
+        'tta_val_acc': float(tta_val_acc),
+        'total_time_seconds': float(total_time_seconds),
+        'epochs_ran': ceil(epochs),
+        'total_train_steps': total_train_steps,
+    }
 
 if __name__ == "__main__":
+    NUM_RUNS = 500
+    CI_Z = 1.96  # 95% CI under normal approximation (post-processing only)
+
     with open(sys.argv[0]) as f:
         code = f.read()
 
     print_columns(logging_columns_list, is_head=True)
     main('warmup')
-    results = [main(run) for run in range(2)]
-    accs = torch.tensor([r[0] for r in results])
-    train_times = torch.tensor([r[1] for r in results])
-    print('Mean: %.4f    Std: %.4f' % (accs.mean(), accs.std()))
-    print('Train time mean: %.4f s    Std: %.4f s' % (train_times.mean().item(), train_times.std().item()))
+    results = [main(run) for run in range(NUM_RUNS)]
 
-    log = {'code': code, 'accs': accs}
+    accs = torch.tensor([res['tta_val_acc'] for res in results])
+    times = torch.tensor([res['total_time_seconds'] for res in results])
+    acc_mean = accs.mean()
+    acc_std = accs.std(unbiased=False)
+    time_mean = times.mean()
+    time_std = times.std(unbiased=False)
+
+    summary = {
+        'num_runs': NUM_RUNS,
+        'acc_mean': acc_mean.item(),
+        'acc_std': acc_std.item(),
+        'acc_stderr': (acc_std / (NUM_RUNS ** 0.5)).item(),
+        'acc_ci95_low': (acc_mean - CI_Z * acc_std / (NUM_RUNS ** 0.5)).item(),
+        'acc_ci95_high': (acc_mean + CI_Z * acc_std / (NUM_RUNS ** 0.5)).item(),
+        'acc_min': accs.min().item(),
+        'acc_max': accs.max().item(),
+        'acc_median': accs.median().item(),
+        'time_mean_seconds': time_mean.item(),
+        'time_std_seconds': time_std.item(),
+        'time_stderr_seconds': (time_std / (NUM_RUNS ** 0.5)).item(),
+        'time_ci95_low_seconds': (time_mean - CI_Z * time_std / (NUM_RUNS ** 0.5)).item(),
+        'time_ci95_high_seconds': (time_mean + CI_Z * time_std / (NUM_RUNS ** 0.5)).item(),
+        'time_min_seconds': times.min().item(),
+        'time_max_seconds': times.max().item(),
+        'time_median_seconds': times.median().item(),
+    }
+
+    print('TTA accuracy mean: %.4f    std: %.4f    min: %.4f    max: %.4f'
+          % (summary['acc_mean'], summary['acc_std'], summary['acc_min'], summary['acc_max']))
+    print('Runtime (seconds) mean: %.4f    std: %.4f    min: %.4f    max: %.4f'
+          % (summary['time_mean_seconds'], summary['time_std_seconds'],
+             summary['time_min_seconds'], summary['time_max_seconds']))
+    print('TTA accuracy 95%% CI: [%.4f, %.4f]    stderr: %.4f'
+          % (summary['acc_ci95_low'], summary['acc_ci95_high'], summary['acc_stderr']))
+    print('Runtime (seconds) 95%% CI: [%.4f, %.4f]    stderr: %.4f'
+          % (summary['time_ci95_low_seconds'], summary['time_ci95_high_seconds'],
+             summary['time_stderr_seconds']))
+
+    log = {'code': code, 'results': results, 'accs': accs, 'times': times, 'summary': summary}
     log_dir = os.path.join('logs', str(uuid.uuid4()))
     os.makedirs(log_dir, exist_ok=True)
     log_path = os.path.join(log_dir, 'log.pt')
-    print(os.path.abspath(log_path))
-    torch.save(log, os.path.join(log_dir, 'log.pt'))
+    summary_json_path = os.path.join(log_dir, 'summary.json')
+    torch.save(log, log_path)
+    with open(summary_json_path, 'w') as f:
+        json.dump({'results': results, 'summary': summary}, f, indent=2)
+
+    print('Log saved to: %s' % os.path.abspath(log_path))
+    print('JSON summary saved to: %s' % os.path.abspath(summary_json_path))

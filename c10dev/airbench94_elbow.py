@@ -302,6 +302,84 @@ def print_training_details(variables, is_final_entry):
     print_columns(formatted, is_final_entry=is_final_entry)
 
 ############################################
+#      Weight Norm Tracking / Plotting      #
+############################################
+
+def get_tracked_blocks(model):
+    # Focus on the blocks you'd likely want to freeze
+    return {
+        'block1': list(model[2].parameters()),
+        'block2': list(model[3].parameters()),
+        'block3': list(model[4].parameters()),
+        'head':   list(model[7].parameters()),
+    }
+
+def clone_block_params(blocks):
+    return {name: [p.detach().float().cpu().clone() for p in params] for name, params in blocks.items()}
+
+def l2_norm_params(params):
+    total = torch.tensor(0.0)
+    for p in params:
+        total += p.pow(2).sum()
+    return torch.sqrt(total).item()
+
+def l2_norm_change(prev_params, curr_params):
+    total = torch.tensor(0.0)
+    for prev, curr in zip(prev_params, curr_params):
+        total += (curr - prev).pow(2).sum()
+    return torch.sqrt(total).item()
+
+def save_weight_change_plots(epochs, deltas, norms, out_dir, run_label):
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print('matplotlib is not installed; skipping weight change plots.')
+        return []
+
+    os.makedirs(out_dir, exist_ok=True)
+
+    # Linear scale delta plot
+    plt.figure(figsize=(8, 5))
+    for name, series in deltas.items():
+        plt.plot(epochs, series, marker='o', label=name)
+    plt.xlabel('Epoch')
+    plt.ylabel('L2 delta vs previous epoch')
+    plt.title('Per-block weight change (linear scale)')
+    plt.grid(True, linestyle='--', alpha=0.4)
+    plt.legend()
+    delta_linear_path = os.path.join(out_dir, f'weight_change_linear_{run_label}.png')
+    plt.savefig(delta_linear_path, dpi=200, bbox_inches='tight')
+    plt.close()
+
+    # Log scale delta plot
+    plt.figure(figsize=(8, 5))
+    for name, series in deltas.items():
+        plt.plot(epochs, series, marker='o', label=name)
+    plt.xlabel('Epoch')
+    plt.ylabel('L2 delta vs previous epoch')
+    plt.title('Per-block weight change')
+    plt.grid(True, linestyle='--', alpha=0.4)
+    plt.yscale('log')
+    plt.legend()
+    delta_log_path = os.path.join(out_dir, f'weight_change_log_{run_label}.png')
+    plt.savefig(delta_log_path, dpi=200, bbox_inches='tight')
+    plt.close()
+
+    plt.figure(figsize=(8, 5))
+    for name, series in norms.items():
+        plt.plot(epochs, series, marker='o', label=name)
+    plt.xlabel('Epoch')
+    plt.ylabel('L2 weight norm')
+    plt.title('Per-block weight norm')
+    plt.grid(True, linestyle='--', alpha=0.4)
+    plt.legend()
+    norm_path = os.path.join(out_dir, f'weight_norm_{run_label}.png')
+    plt.savefig(norm_path, dpi=200, bbox_inches='tight')
+    plt.close()
+
+    return [delta_linear_path, delta_log_path, norm_path]
+
+############################################
 #               Evaluation                 #
 ############################################
 
@@ -348,8 +426,9 @@ def evaluate(model, loader, tta_level=0):
 #                Training                  #
 ############################################
 
-def main(run):
+def main(run, save_plots=True):
 
+    run_label = str(run)
     batch_size = hyp['opt']['batch_size']
     epochs = hyp['opt']['train_epochs']
     momentum = hyp['opt']['momentum']
@@ -371,6 +450,22 @@ def main(run):
     total_train_steps = ceil(len(train_loader) * epochs)
 
     model = make_net()
+
+    # Track weight movement to decide which blocks to freeze later
+    weight_artifacts = {'artifact_dir': None, 'metrics_path': None, 'plot_paths': [], 'history': None}
+    tracked_blocks = None
+    weight_history = None
+    if save_plots:
+        tracked_blocks = get_tracked_blocks(model)
+        weight_history = {
+            'epochs': [],
+            'deltas': {name: [] for name in tracked_blocks},
+            'norms': {name: [] for name in tracked_blocks},
+        }
+        prev_block_params = clone_block_params(tracked_blocks)
+        weight_artifacts['artifact_dir'] = os.path.join('logs', f'weight_change_{run_label}_{uuid.uuid4().hex[:8]}')
+        os.makedirs(weight_artifacts['artifact_dir'], exist_ok=True)
+
     current_steps = 0
 
     norm_biases = [p for k, p in model.named_parameters() if 'norm' in k and p.requires_grad]
@@ -440,6 +535,14 @@ def main(run):
         torch.cuda.synchronize()
         total_time_seconds += 1e-3 * starter.elapsed_time(ender)
 
+        if weight_history is not None:
+            weight_history['epochs'].append(epoch + 1)
+            curr_block_params = clone_block_params(tracked_blocks)
+            for name in tracked_blocks:
+                weight_history['deltas'][name].append(l2_norm_change(prev_block_params[name], curr_block_params[name]))
+                weight_history['norms'][name].append(l2_norm_params(curr_block_params[name]))
+            prev_block_params = curr_block_params
+
         ####################
         #    Evaluation    #
         ####################
@@ -450,6 +553,22 @@ def main(run):
         val_acc = evaluate(model, test_loader, tta_level=0)
         print_training_details(locals(), is_final_entry=False)
         run = None # Only print the run number once
+
+    if weight_history is not None and weight_history['epochs']:
+        weight_artifacts['history'] = weight_history
+        metrics_path = os.path.join(weight_artifacts['artifact_dir'], 'weight_change.pt')
+        torch.save(weight_history, metrics_path)
+        weight_artifacts['metrics_path'] = metrics_path
+        weight_artifacts['plot_paths'] = save_weight_change_plots(
+            weight_history['epochs'],
+            weight_history['deltas'],
+            weight_history['norms'],
+            weight_artifacts['artifact_dir'],
+            run_label,
+        )
+        print(f"Saved weight-change metrics to {os.path.abspath(metrics_path)}")
+        for path in weight_artifacts['plot_paths']:
+            print(f"Saved weight-change plot to {os.path.abspath(path)}")
 
     ####################
     #  TTA Evaluation  #
@@ -465,21 +584,25 @@ def main(run):
     epoch = 'eval'
     print_training_details(locals(), is_final_entry=True)
 
-    return tta_val_acc, train_time_seconds
+    return tta_val_acc, train_time_seconds, weight_artifacts
 
 if __name__ == "__main__":
     with open(sys.argv[0]) as f:
         code = f.read()
 
     print_columns(logging_columns_list, is_head=True)
-    main('warmup')
+    main('warmup', save_plots=False)
     results = [main(run) for run in range(2)]
     accs = torch.tensor([r[0] for r in results])
     train_times = torch.tensor([r[1] for r in results])
+    weight_artifacts = [r[2] for r in results]
     print('Mean: %.4f    Std: %.4f' % (accs.mean(), accs.std()))
     print('Train time mean: %.4f s    Std: %.4f s' % (train_times.mean().item(), train_times.std().item()))
+    for idx, art in enumerate(weight_artifacts):
+        if art.get('metrics_path'):
+            print(f'Run {idx} weight-change data: {os.path.abspath(art["metrics_path"])}')
 
-    log = {'code': code, 'accs': accs}
+    log = {'code': code, 'accs': accs, 'train_times': train_times, 'weight_change_artifacts': weight_artifacts}
     log_dir = os.path.join('logs', str(uuid.uuid4()))
     os.makedirs(log_dir, exist_ok=True)
     log_path = os.path.join(log_dir, 'log.pt')
